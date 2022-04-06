@@ -6,72 +6,62 @@ using System.Collections.Generic;
 using System.Security.Cryptography;
 using Amazon.Lambda.Core;
 using Amazon.Lambda.APIGatewayEvents;
-using HttpMultipartParser;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Security;
 using PKHeX.Core;
+using System.Linq;
 
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.Json.JsonSerializer))]
 
 namespace PKHeXLambda
 {
-    public delegate JObject ConvertPKXToJSON(string base64PKX);
+    public delegate byte[] ConvertEKXToSignedResponse(byte[] EKX);
     public class Functions
     {
         /// <summary>
         /// Local testing
         /// </summary>
         static void Main(string[] args) {
-            var base64PKX = args.Length == 0 ? "" : args[0];
-            var json = ConvertBase64PKXToJSON(base64PKX);
+            var base64EKX = args.Length == 0 ? "" : args[0];
+            var json = ConvertEKXToSignedResponse(base64EKX.ToByteArray());
             Console.WriteLine(json.ToString());
         }
 
         /// <summary>
-        /// Creates a JSON from a base 64 encoded PKX
+        /// Creates a signed JSON from a base 64 encoded EKX
         /// </summary>
-        static private JObject ConvertBase64PKXToJSON(string base64PKX) {
-            byte[] data = System.Convert.FromBase64String(base64PKX);
-            var pkx = PKMConverter.GetPKMfromBytes(data) ?? new PK8();
-            var legalityAnalysis = new LegalityAnalysis(pkx);
+        static private byte[] ConvertEKXToSignedResponse(byte[] EKX) {
+            byte[] data = new byte[EKX.Length];
+            Array.Copy(EKX, data, EKX.Length);
+            PokeCrypto.DecryptIfEncrypted67(ref data);
+            Array.Resize(ref data, 0x104);
+            var PKM = PKMConverter.GetPKMfromBytes(data);
+            var legalityAnalysis = new LegalityAnalysis(PKM);
             bool isLegal = legalityAnalysis.Report(false) == "Legal!";
-            var jPKX = (JObject)JToken.FromObject(pkx);
-
-            jPKX.Add("IsLegal", isLegal);
-
-            return jPKX;
-        }
-
-        /// <summary>
-        /// Creates a signed JSON from a base 64 encoded PKX
-        /// </summary>
-        static private JObject ConvertBase64PKXToSignedJSON(string base64PKX) {
-            var jPKX = ConvertBase64PKXToJSON(base64PKX);
-
-            var jPKXString = jPKX.ToString(Formatting.None);
-            var json = new JObject();
-
-            json.Add("pkx", jPKXString);
-            json.Add("signature", SignData(jPKXString));
-
-            return json;
+            if (!isLegal)
+            {
+                return new byte[] { 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x96 };
+            } else
+            {
+                byte[] header = { 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+                byte[] response = header.Concat(SignData(EKX)).ToArray();
+                return response;
+            }
         }
 
         /// <summary>
         /// Signs a string given to it
         /// </summary>
-        static private string SignData(string data) {
+        static private byte[] SignData(byte[] data) {
             var sha1 = new SHA1Managed();
-            var hash = sha1.ComputeHash(Encoding.UTF8.GetBytes(data));
+            var hash = sha1.ComputeHash(data);
             // This should be replaced with Secrets Manager
             string pem = Environment.GetEnvironmentVariable("PRIVATE_KEY").Replace("\\n", "\n");
             var pr = new PemReader(new StringReader(pem));
             var KeyPair = (RsaPrivateCrtKeyParameters)pr.ReadObject();
-            var rsaParams = DotNetUtilities.ToRSAParameters((RsaPrivateCrtKeyParameters)KeyPair);
+            var rsaParams = DotNetUtilities.ToRSAParameters(KeyPair);
             var rsa = new RSACryptoServiceProvider();
             
             rsa.ImportParameters(rsaParams);
@@ -80,52 +70,45 @@ namespace PKHeXLambda
 
             rsaFormatter.SetHashAlgorithm("SHA1");
 
-            var signedHash = rsaFormatter.CreateSignature(hash);
-
-            return Convert.ToBase64String(signedHash);
+            return rsaFormatter.CreateSignature(hash);
         }
 
 
         /// <summary>
         /// Lambda function to respond to HTTP methods from API Gateway
         /// </summary>
-        static private APIGatewayProxyResponse ConvertPKXAsLambda(APIGatewayProxyRequest request, ILambdaContext context, ConvertPKXToJSON ConvertPKX)
+        static private APIGatewayProxyResponse ConvertEKXAsLambda(APIGatewayProxyRequest request, ILambdaContext context, ConvertEKXToSignedResponse ConvertEKX)
         {
             var response = new APIGatewayProxyResponse
             {
                 StatusCode = (int)HttpStatusCode.BadRequest,
-                Body = "{}",
-                Headers = new Dictionary<string, string> { { "Content-Type", "application/json" } }
+                Body = "",
+                Headers = new Dictionary<string, string> { { "Content-Type", "application/octet-stream" } },
+                IsBase64Encoded = true
             };
 
             if (String.IsNullOrEmpty(request.Body)) return response;
 
             var requestBody = request.IsBase64Encoded ? Convert.FromBase64String(request.Body) : Encoding.UTF8.GetBytes(request.Body);
-            var parser = MultipartFormDataParser.Parse(new MemoryStream(requestBody));
-            var base64PKX = parser.GetParameterValue("pkx");
+            if (requestBody.Length < 0x104) return response;
 
-            if (String.IsNullOrEmpty(base64PKX)) return response;
+            var EKX = requestBody[(requestBody.Length - 0x104)..];
 
-            var json = ConvertPKX(base64PKX);
+            if (EKX.Length == 0) return response;
 
-            response.Body = json.ToString();
+            var body = ConvertEKX(EKX);
+
+            response.Body = Convert.ToBase64String(body);
             response.StatusCode = (int)HttpStatusCode.OK;
 
             return response;
         }
 
         /// <summary>
-        /// Lambda function to respond to HTTP methods from API Gateway with a PKX
+        /// Lambda function to respond to HTTP methods from API Gateway with a signed EKX
         /// </summary>
-        public APIGatewayProxyResponse ParsePKX(APIGatewayProxyRequest request, ILambdaContext context) {
-            return ConvertPKXAsLambda(request, context, ConvertBase64PKXToJSON);
-        }
-
-        /// <summary>
-        /// Lambda function to respond to HTTP methods from API Gateway with a signed PKX
-        /// </summary>
-        public APIGatewayProxyResponse ParseAndSignPKX(APIGatewayProxyRequest request, ILambdaContext context) {
-            return ConvertPKXAsLambda(request, context, ConvertBase64PKXToSignedJSON);
+        public APIGatewayProxyResponse ParseAndSignEKX(APIGatewayProxyRequest request, ILambdaContext context) {
+            return ConvertEKXAsLambda(request, context, ConvertEKXToSignedResponse);
         }
     }
 }
