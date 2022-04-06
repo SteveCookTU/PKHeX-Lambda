@@ -101,9 +101,9 @@ namespace PKHeXLambda
             if (String.IsNullOrEmpty(request.Body)) return response;
 
             var requestBody = request.IsBase64Encoded ? Convert.FromBase64String(request.Body) : Encoding.UTF8.GetBytes(request.Body);
-            if (requestBody.Length < 0x104) return response;
+            if (requestBody.Length < 0xE8) return response;
 
-            var EKX = requestBody[(requestBody.Length - 0x104)..];
+            var EKX = requestBody[(requestBody.Length - 0xE8)..];
 
             if (EKX.Length == 0) return response;
 
