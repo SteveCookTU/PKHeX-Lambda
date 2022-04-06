@@ -11,6 +11,7 @@ using Org.BouncyCastle.OpenSsl;
 using Org.BouncyCastle.Security;
 using PKHeX.Core;
 using System.Linq;
+using Org.BouncyCastle.Crypto;
 
 // Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.Json.JsonSerializer))]
@@ -25,8 +26,18 @@ namespace PKHeXLambda
         /// </summary>
         static void Main(string[] args) {
             var base64EKX = args.Length == 0 ? "" : args[0];
-            var json = ConvertEKXToSignedResponse(base64EKX.ToByteArray());
-            Console.WriteLine(json.ToString());
+            Console.WriteLine(base64EKX + "\n-----");
+            var bytes = StringToByteArray(base64EKX);
+            var body = Convert.ToBase64String(ConvertEKXToSignedResponse(bytes));
+            Console.WriteLine(body);
+        }
+
+        static byte[] StringToByteArray(string hex)
+        {
+            return Enumerable.Range(0, hex.Length)
+                             .Where(x => x % 2 == 0)
+                             .Select(x => Convert.ToByte(hex.Substring(x, 2), 16))
+                             .ToArray();
         }
 
         /// <summary>
@@ -58,10 +69,10 @@ namespace PKHeXLambda
             var sha1 = new SHA1Managed();
             var hash = sha1.ComputeHash(data);
             // This should be replaced with Secrets Manager
-            string pem = Environment.GetEnvironmentVariable("PRIVATE_KEY").Replace("\\n", "\n");
+            string pem = Environment.GetEnvironmentVariable("PRIVATE_KEY").Replace("\\n", "\n").Trim();
             var pr = new PemReader(new StringReader(pem));
-            var KeyPair = (RsaPrivateCrtKeyParameters)pr.ReadObject();
-            var rsaParams = DotNetUtilities.ToRSAParameters(KeyPair);
+            var KeyPair = (AsymmetricCipherKeyPair)pr.ReadObject();
+            var rsaParams = DotNetUtilities.ToRSAParameters((RsaPrivateCrtKeyParameters)KeyPair.Private);
             var rsa = new RSACryptoServiceProvider();
             
             rsa.ImportParameters(rsaParams);
